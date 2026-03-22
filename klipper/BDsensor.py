@@ -54,6 +54,22 @@ def run_single_probe(probe, gcmd):
     probe_session.end_probe_session()
     return pos
 
+# Calculate the average Z from a set of positions
+def calc_probe_z_average(positions, method='average'):
+    if method != 'median':
+        # Use mean average
+        inv_count = 1. / float(len(positions))
+        return manual_probe.ProbeResult(
+            *[sum([pos[i] for pos in positions]) * inv_count
+              for i in range(len(positions[0]))])
+    # Use median
+    z_sorted = sorted(positions, key=(lambda p: p.bed_z))
+    middle = len(positions) // 2
+    if (len(positions) & 1) == 1:
+        # odd number of samples
+        return z_sorted[middle]
+    # even number of samples
+    return calc_probe_z_average(z_sorted[middle-1:middle+1], 'average')
 
 # I2C BD_SENSOR
 # devices connected to an MCU via an virtual i2c bus(2 any gpio)
@@ -64,10 +80,23 @@ consider reducing the Z axis minimum position so the probe
 can travel further (the Z minimum position can be negative).
 """
 
-
+# Helper to read the xyz probe offsets from the config
+class ProbeOffsetsHelper:
+    def __init__(self, config):
+        self.x_offset = config.getfloat('x_offset', 0.)
+        self.y_offset = config.getfloat('y_offset', 0.)
+        self.z_offset = config.getfloat('z_offset')
+    def get_offsets(self, gcmd=None):
+        return self.x_offset, self.y_offset, self.z_offset
+    def create_probe_result(self, test_pos):
+        return manual_probe.ProbeResult(
+            test_pos[0]+self.x_offset, test_pos[1]+self.y_offset,
+            test_pos[2]-self.z_offset, test_pos[0], test_pos[1], test_pos[2])
+    
 class BDPrinterProbe:
     def __init__(self, config, mcu_probe):
         self.printer = config.get_printer()
+        self.probe_offsets = ProbeOffsetsHelper(config)
         self.name = config.get_name()
         self.config = config
         self.mcu_probe = mcu_probe
@@ -104,7 +133,7 @@ class BDPrinterProbe:
         self.samples_retries = config.getint("samples_tolerance_retries", 0, minval=0)
         # Register z_virtual_endstop pin
         self.printer.lookup_object("pins").register_chip("probe", self)
-
+        self.probe_calibrate_info = None
         # Register homing event handlers
         self.printer.register_event_handler(
             "homing:homing_move_begin", self._handle_homing_move_begin
@@ -277,10 +306,11 @@ class BDPrinterProbe:
             return gcmd.get_float("LIFT_SPEED", self.lift_speed, above=0.0)
         return self.lift_speed
 
-    def get_offsets(self):
-        return self.x_offset, self.y_offset, self.z_offset
+    def get_offsets(self, gcmd=None):
+        #return self.x_offset, self.y_offset, self.z_offset
+        return self.probe_offsets.get_offsets(gcmd)
 
-    def _probe_enstop(self, speed):
+    def _probe_external_endstop(self, speed):
         toolhead = self.printer.lookup_object("toolhead")
         curtime = self.printer.get_reactor().monotonic()
         if "z" not in toolhead.get_status(curtime)["homed_axes"]:
@@ -289,23 +319,24 @@ class BDPrinterProbe:
         pos = toolhead.get_position()
         pos[2] = self.z_position
         try:
-            epos = phoming.probing_move(self.mcu_probe, pos, speed)
+            ppos = phoming.probing_move(self.mcu_probe, pos, speed)
         except self.printer.command_error as e:
             reason = str(e)
             if "Timeout during endstop homing" in reason:
                 reason += HINT_TIMEOUT
             raise self.printer.command_error(reason)
         # Allow axis_twist_compensation to update results
-        self.printer.send_event("probe:update_results", epos)
+        epos = self.probe_offsets.create_probe_result(ppos)
+        self.printer.send_event("probe:update_results", [epos])
         # add z compensation to probe position
         gcode = self.printer.lookup_object("gcode")
-        gcode.respond_info("probe at %.3f,%.3f is z=%.6f" % (epos[0], epos[1], epos[2]))
-        return epos[:3]
+        gcode.respond_info("probe: at %.3f,%.3f bed will contact at z=%.6f" % (epos.bed_x, epos.bed_y, epos.bed_z))
+        return epos
 
     def _probe(self, speed):
         self.mcu_probe.homing = 0
         if self.mcu_probe.endstop_pin_num != self.mcu_probe.sda_pin_num:
-            return self._probe_enstop(speed)
+            return self._probe_external_endstop(speed)
         toolhead = self.printer.lookup_object("toolhead")
         curtime = self.printer.get_reactor().monotonic()
         if "z" not in toolhead.get_status(curtime)["homed_axes"]:
@@ -317,7 +348,7 @@ class BDPrinterProbe:
         )
         pos[2] = self.z_position
         try:
-            epos = phoming.probing_move(self.mcu_probe, pos, speed)
+            ppos = phoming.probing_move(self.mcu_probe, pos, speed)
         except self.printer.command_error as e:
             reason = str(e)
             if "Timeout during endstop homing" in reason:
@@ -331,15 +362,16 @@ class BDPrinterProbe:
         b_value = b_value + self.mcu_probe.BD_Sensor_Read(2)
         b_value = b_value / 3
         pos_new = toolhead.get_position()
-        epos[2] = pos_new[2] - b_value + self.mcu_probe.endstop_bdsensor_offset
+        ppos[2] = pos_new[2] - b_value + self.mcu_probe.endstop_bdsensor_offset
+        epos = self.probe_offsets.create_probe_result(ppos)
         # Allow axis_twist_compensation to update results
-        self.printer.send_event("probe:update_results", epos)
-        self.gcode.respond_info(
-            "probe at %.3f,%.3f is z=%.6f (pos:%.6f - bd:%.3f)"
-            % (epos[0], epos[1], epos[2], pos_new[2], b_value)
-        )
+        self.printer.send_event("probe:update_results", [epos])
+        # Report results
+        gcode = self.printer.lookup_object('gcode')
+        gcode.respond_info("0probe: at %.3f,%.3f bed will contact at z=%.6f"
+                           % (epos.bed_x, epos.bed_y, epos.bed_z))
         # self.mcu_probe.homeing = 0
-        return epos[:3]
+        return epos
 
     def _move(self, coord, speed):
         self.printer.lookup_object("toolhead").manual_move(coord, speed)
@@ -349,7 +381,7 @@ class BDPrinterProbe:
         return [sum([pos[i] for pos in positions]) / count for i in range(3)]
 
     def _calc_median(self, positions):
-        z_sorted = sorted(positions, key=(lambda p: p[2]))
+        z_sorted = sorted(positions, key=(lambda p: p.bed_z))
         middle = len(positions) // 2
         if (len(positions) & 1) == 1:
             # odd number of samples
@@ -415,14 +447,14 @@ class BDPrinterProbe:
                         except Exception:
                             pass
 
-                    self.mcu_probe.results.append(pos)
+                    epos = self.probe_offsets.create_probe_result(pos)
+                    self.mcu_probe.results.append(epos)
                     # Allow axis_twist_compensation to update results
-                    # self.printer.send_event("probe:update_results", pos)
+                    #self.printer.send_event("probe:update_results", [epos])
                     # limit the message output to the console else it may take a lot of time
                     if len(self.mcu_probe.results) < 500:
-                        self.gcode.respond_info(
-                            "probe at %.3f,%.3f is z=%.6f" % (pos[0], pos[1], pos[2])
-                        )
+                        self.gcode.respond_info("probe: at %.3f,%.3f bed will contact at z=%.6f"
+                                 % (epos.bed_x, epos.bed_y, epos.bed_z))
                     break
                 toolhead.reactor.pause(systime + 0.002)
             self._probe_times.pop(0)
@@ -481,13 +513,18 @@ class BDPrinterProbe:
                     pos = toolhead.get_position()
                     intd = self.mcu_probe.BD_Sensor_Read(0)
                     pos[2] = pos[2] - intd + self.mcu_probe.endstop_bdsensor_offset
-                    self.gcode.respond_info(
-                        "probe at %.3f,%.3f is z=%.6f" % (pos[0], pos[1], pos[2])
-                    )
+                    epos = self.probe_offsets.create_probe_result(pos)
+                    # Allow axis_twist_compensation to update results
+                    self.printer.send_event("probe:update_results", [epos])
+                    # Report results
+                    gcode = self.printer.lookup_object('gcode')
+                    gcode.respond_info("run probe: at %.3f,%.3f bed will contact at z=%.6f"
+                                    % (epos.bed_x, epos.bed_y, epos.bed_z))
                     # return pos[:3]
-                    positions.append(pos[:3])
+                   # positions.append(pos[:3])
+                    positions.append(epos)
                     # Check samples tolerance
-                    z_positions = [p[2] for p in positions]
+                    z_positions = [p.bed_z for p in positions]
                     if max(z_positions) - min(z_positions) > samples_tolerance:
                         if retries >= samples_retries:
                             raise gcmd.error(
@@ -506,7 +543,7 @@ class BDPrinterProbe:
             pos = self._probe(speed)
             positions.append(pos)
             # Check samples tolerance
-            z_positions = [p[2] for p in positions]
+            z_positions = [p.bed_z for p in positions]
             if max(z_positions) - min(z_positions) > samples_tolerance:
                 if retries >= samples_retries:
                     raise gcmd.error("Probe samples exceed samples_tolerance")
@@ -515,22 +552,33 @@ class BDPrinterProbe:
                 positions = []
             # Retract
             if len(positions) < sample_count:
-                self._move(probexy + [pos[2] + sample_retract_dist], lift_speed)
+                cur_z = toolhead.get_position()[2]
+                self._move(probexy + [cur_z + sample_retract_dist], lift_speed)
         if must_notify_multi_probe:
             self.multi_probe_end()
-        # Calculate and return result
-        if samples_result == "median":
-            return self._calc_median(positions)
-        epos = self._calc_mean(positions)
-        # epos = calc_probe_z_average(positions, params['samples_result'])
+        # # Calculate and return result
+        # if samples_result == 'median':
+        #     return self._calc_median(positions)
+        # epos = self._calc_mean(positions)
+        # #epos = calc_probe_z_average(positions, params['samples_result'])
+        # self.mcu_probe.results.append(epos)
+
+        # Calculate result
+        epos = calc_probe_z_average(positions, samples_result)
+        #self.results.append(epos)
         self.mcu_probe.results.append(epos)
 
     cmd_PROBE_help = "Probe Z-height at current XY position"
 
     def cmd_PROBE(self, gcmd):
         pos = run_single_probe(self, gcmd)
-        gcmd.respond_info("Result is z=%.6f" % (pos[2],))
-        self.last_z_result = pos[2]
+        gcmd.respond_info("Result: at %.3f,%.3f estimate contact at z=%.6f"
+                          % (pos.bed_x, pos.bed_y, pos.bed_z))
+        gcode = self.printer.lookup_object('gcode')
+        self.last_probe_position = gcode.Coord((pos.bed_x, pos.bed_y,
+                                                pos.bed_z))
+        x_offset, y_offset, z_offset = self.probe.get_offsets(gcmd)
+        self.last_z_result = pos.bed_z + z_offset # Deprecated
 
     cmd_QUERY_PROBE_help = "Return the status of the z-probe"
 
@@ -555,26 +603,17 @@ class BDPrinterProbe:
         speed = gcmd.get_float("PROBE_SPEED", self.speed, above=0.0)
         lift_speed = self.get_lift_speed(gcmd)
         sample_count = gcmd.get_int("SAMPLES", 10, minval=1)
-        sample_retract_dist = gcmd.get_float(
-            "SAMPLE_RETRACT_DIST", self.sample_retract_dist, above=0.0
-        )
-        toolhead = self.printer.lookup_object("toolhead")
-        pos = toolhead.get_position()
-        pos[2] = 1.0
-        gcmd.respond_info(
-            "PROBE_ACCURACY at X:%.3f Y:%.3f Z:%.3f"
-            " (samples=%d retract=%.3f"
-            " speed=%.1f lift_speed=%.1f)\n"
-            % (
-                pos[0],
-                pos[1],
-                pos[2],
-                sample_count,
-                sample_retract_dist,
-                speed,
-                lift_speed,
-            )
-        )
+        sample_retract_dist = gcmd.get_float("SAMPLE_RETRACT_DIST",
+                                             self.sample_retract_dist, above=0.)
+        toolhead = self.printer.lookup_object('toolhead')
+        start_pos = toolhead.get_position()
+        start_pos[2] = 1.0
+        gcmd.respond_info("PROBE_ACCURACY at X:%.3f Y:%.3f Z:%.3f"
+                          " (samples=%d retract=%.3f"
+                          " speed=%.1f lift_speed=%.1f)\n"
+                          % (start_pos[0], start_pos[1], start_pos[2],
+                             sample_count, sample_retract_dist,
+                             speed, lift_speed))
         # Probe bed sample_count times
 
         # toolhead.manual_move([None, None, pos[2]], speed)
@@ -590,22 +629,22 @@ class BDPrinterProbe:
             probe_session.run_probe(fo_gcmd)
             probe_num += 1
             # Retract
-            pos = toolhead.get_position()
-            liftpos = [None, None, pos[2] + params["sample_retract_dist"]]
+            lift_z = toolhead.get_position()[2] + params["sample_retract_dist"]
+            liftpos = [start_pos[0], start_pos[1], lift_z]
             self._move(liftpos, params["lift_speed"])
         positions = probe_session.pull_probed_results()
         probe_session.end_probe_session()
 
         # Calculate maximum, minimum and average values
-        max_value = max([p[2] for p in positions])
-        min_value = min([p[2] for p in positions])
+        max_value = max([p.bed_z for p in positions])
+        min_value = min([p.bed_z for p in positions])
         range_value = max_value - min_value
-        avg_value = self._calc_mean(positions)[2]
-        median = self._calc_median(positions)[2]
+        avg_value = self._calc_mean(positions).bed_z
+        median = self._calc_median(positions).bed_z
         # calculate the standard deviation
         deviation_sum = 0
         for i in range(len(positions)):
-            deviation_sum += pow(positions[i][2] - avg_value, 2.0)
+            deviation_sum += pow(positions[i].bed_z - avg_value, 2.0)
         sigma = (deviation_sum / len(positions)) ** 0.5
         # Show information
         gcmd.respond_info(
@@ -614,11 +653,11 @@ class BDPrinterProbe:
             % (max_value, min_value, range_value, avg_value, median, sigma)
         )
 
-    def probe_calibrate_finalize(self, kin_pos):
-        if kin_pos is None:
+    def probe_calibrate_finalize(self, mpresult):
+        if mpresult is None:
             return
-
-        z_offset = self.probe_calibrate_z - kin_pos[2]
+        ppos, offsets = self.probe_calibrate_info
+        z_offset = offsets[2] - mpresult.bed_z + ppos.bed_z
         self.gcode.respond_info(
             "%s: z_offset: %.3f\n"
             "The SAVE_CONFIG command will update the printer config file\n"
@@ -629,26 +668,24 @@ class BDPrinterProbe:
 
     cmd_PROBE_CALIBRATE_help = "Calibrate the probe's z_offset"
 
-    def cmd_PROBE_CALIBRATE(self, gcmd):
+    def cmd_PROBE_CALIBRATE(self, gcmd):      
         manual_probe.verify_no_manual_probe(self.printer)
-        # Perform initial probe
-        lift_speed = self.get_lift_speed(gcmd)
         params = self.get_probe_params(gcmd)
-        curpos = run_single_probe(self, gcmd)
+        # Perform initial probe
+        ppos = run_single_probe(self, gcmd)
         # Move away from the bed
-        self.probe_calibrate_z = curpos[2]
+        curpos = self.printer.lookup_object('toolhead').get_position()
         curpos[2] += 5.0
-        self._move(curpos, lift_speed)
+        self._move(curpos, params['lift_speed'])
         # Move the nozzle over the probe point
-        x_offset, y_offset, z_offset = self.get_offsets()
-        curpos[0] += x_offset
-        curpos[1] += y_offset
+        curpos[0] = ppos.bed_x
+        curpos[1] = ppos.bed_y
         self._move(curpos, params["probe_speed"])
         # Start manual probe
-        manual_probe.ManualProbeHelper(
-            self.printer, gcmd, self.probe_calibrate_finalize
-        )
-
+        self.probe_calibrate_info = (ppos, self.get_offsets(gcmd))
+        manual_probe.ManualProbeHelper(self.printer, gcmd,
+                                       self.probe_calibrate_finalize)
+        
     cmd_Z_OFFSET_APPLY_PROBE_help = "Adjust the probe's z_offset"
 
     def cmd_Z_OFFSET_APPLY_PROBE(self, gcmd):
@@ -657,7 +694,8 @@ class BDPrinterProbe:
         if offset == 0:
             self.gcode.respond_info("Nothing to do: Z Offset is 0")
         else:
-            new_calibrate = self.z_offset - offset
+            z_offset = self.probe_offsets.get_offsets(gcmd)[2]
+            new_calibrate = z_offset - offset
             self.gcode.respond_info(
                 "%s: z_offset: %.3f\n"
                 "The SAVE_CONFIG command will update the printer config file\n"
@@ -832,6 +870,7 @@ class BDsensorEndstopWrapper:
         self.ncont = 0
         self.z_last = 0
         self.z_offset_adj = 0
+        self.test_v = 0.0
 
     def get_mcu(self):
         return self.mcu
@@ -845,8 +884,10 @@ class BDsensorEndstopWrapper:
             cq=self.cmd_queue,
         )
 
-        self.mcu.register_response(self._handle_BD_Update, "BD_Update", self.oid)
-        self.mcu.register_response(self.handle_probe_Update, "X_probe_Update", self.oid)
+    #    self.mcu.register_serial_response(self._handle_BD_Update,
+     #                              "BD_Update", self.oid)
+      #  self.mcu.register_serial_response(self.handle_probe_Update,
+      #                             "X_probe_Update", self.oid)
         self.mcu_endstop.add_config_cmd(
             "BDendstop_home oid=%d clock=0 sample_ticks=0 sample_count=0"
             " rest_ticks=0 pin_value=0 trsync_oid=0 trigger_reason=0"
@@ -866,8 +907,10 @@ class BDsensorEndstopWrapper:
         data = int(data)
         if cmd == CMD_READ_DATA or cmd == CMD_READ_ENDSTOP:
             pr = self.I2C_BD_send_cmd.send([self.oid, cmd, data])
-            # self.gcode.respond_info(f"{pr}")
-            return int(pr["r"])
+            #self.gcode.respond_info(f"{pr}")
+            #self.test_v = self.test_v + 5
+            #return self.test_v #int(pr['r'])
+            return int(pr['r'])
         else:
             return self.I2C_BD_send_cmd.send([self.oid, cmd, data])
 
@@ -1366,10 +1409,20 @@ class BDsensorEndstopWrapper:
                 self.add_stepper(stepper)
 
     def raise_probe(self):
-        return
-
+        toolhead = self.printer.lookup_object('toolhead')
+        start_pos = toolhead.get_position()
+        self.deactivate_gcode.run_gcode_from_command()
+        if toolhead.get_position()[:3] != start_pos[:3]:
+            raise self.printer.command_error(
+                "Toolhead moved during probe deactivate_gcode script")
     def lower_probe(self):
-        return
+        toolhead = self.printer.lookup_object('toolhead')
+        start_pos = toolhead.get_position()
+        self.activate_gcode.run_gcode_from_command()
+        if toolhead.get_position()[:3] != start_pos[:3]:
+            raise self.printer.command_error(
+                "Toolhead moved during probe activate_gcode script")
+
 
     def query_endstop(self, print_time=0):
         params = 1
@@ -1691,6 +1744,8 @@ class BDsensorEndstopWrapper:
 
     def get_position_endstop(self):
         # print("BD get_position_endstop")
+        if self.endstop_pin_num != self.sda_pin_num:
+            return 0
         return self.position_endstop
 
     def bd_axis_twist_calibrate(self, gcmd):

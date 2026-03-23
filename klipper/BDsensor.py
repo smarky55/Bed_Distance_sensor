@@ -368,7 +368,7 @@ class BDPrinterProbe:
         self.printer.send_event("probe:update_results", [epos])
         # Report results
         gcode = self.printer.lookup_object('gcode')
-        gcode.respond_info("0probe: at %.3f,%.3f bed will contact at z=%.6f"
+        gcode.respond_info("probe: at %.3f,%.3f bed will contact at z=%.6f"
                            % (epos.bed_x, epos.bed_y, epos.bed_z))
         # self.mcu_probe.homeing = 0
         return epos
@@ -1822,13 +1822,13 @@ class BDsensorEndstopWrapper:
             if current_axis == 'X':
                 start_val, end_val = scan_min_x, scan_max_x
                 fixed_pos = center_y
-                probe_pos = fixed_pos + probe_offsets[1]
+                probe_pos = fixed_pos - probe_offsets[1]
                 if start_val < phys_min_x + 5: start_val = phys_min_x + 5
                 if end_val > phys_max_x - 5: end_val = phys_max_x - 5
             else:
                 start_val, end_val = scan_min_y, scan_max_y
                 fixed_pos = center_x
-                probe_pos = fixed_pos + probe_offsets[0]
+                probe_pos = fixed_pos - probe_offsets[0]
                 if start_val < phys_min_y + 5: start_val = phys_min_y + 5
                 if end_val > phys_max_y - 5: end_val = phys_max_y - 5
 
@@ -1868,7 +1868,7 @@ class BDsensorEndstopWrapper:
 
                 time.sleep(0.1)
 
-                val = heights[1]-heights[0]
+                val = heights[1].bed_z - heights[0].bed_z
                 axis_data_points.append([current_pos_val, val])
                 self.gcode.respond_info("   Pt %d: Pos=%.1f | Z=%.4f" % (i+1, current_pos_val, val))
                 self.toolhead.manual_move([None, None, z_hop], 100.0)

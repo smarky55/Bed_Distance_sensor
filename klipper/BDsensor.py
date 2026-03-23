@@ -1772,6 +1772,10 @@ class BDsensorEndstopWrapper:
         toolhead = self.printer.lookup_object('toolhead')
         probe = self.printer.lookup_object('probe')
         probe_offsets = probe.probe_offsets.get_offsets(gcmd)
+        g28_func = self.gcode.ready_gcode_handlers.get(self.g28_cmd)
+        homing_override = self.printer.lookup_object('homing_override')
+        if (homing_override is not None):
+            g28_func = homing_override.prev_G28
 
         # Limits (Same safe logic as before)
         scan_min_x, scan_max_x = 20.0, 200.0
@@ -1848,10 +1852,11 @@ class BDsensorEndstopWrapper:
                 self.toolhead.manual_move(nozzle_target, 100.0)
                 self.toolhead.wait_moves()
                 # self.gcode.run_script_from_command("G28 Z")
-                session = probe.start_probe_session(gcmd)
+                
                 # Perform probe with nozzle collision
                 self.collision_homing = 1
-                session.run_probe(gcmd)
+                g28_func(gcmd)
+                nozzle_val = self.bd_value
 
                 # Move to probe without nozzle
                 self.toolhead.manual_move(probe_target, 100.0)
@@ -1859,16 +1864,12 @@ class BDsensorEndstopWrapper:
 
                 # Run non-contact probe
                 self.collision_homing = 0
-                session.run_probe(gcmd)
-                heights = session.pull_probed_results()
-                session.end_probe_session()
-
-                if len(heights) != 2:
-                    raise self.printer.command_error(f"Invalid number of points probed: {len(heights)}")
+                g28_func(gcmd)
+                probe_val = self.bd_value
 
                 time.sleep(0.1)
 
-                val = heights[1].bed_z - heights[0].bed_z
+                val = probe_val - nozzle_val
                 axis_data_points.append([current_pos_val, val])
                 self.gcode.respond_info("   Pt %d: Pos=%.1f | Z=%.4f" % (i+1, current_pos_val, val))
                 self.toolhead.manual_move([None, None, z_hop], 100.0)

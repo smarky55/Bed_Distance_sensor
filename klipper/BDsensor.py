@@ -1770,6 +1770,8 @@ class BDsensorEndstopWrapper:
 
         self.is_axis_twist_active = True
         toolhead = self.printer.lookup_object('toolhead')
+        probe = self.printer.lookup_object('probe')
+        probe_offsets = probe.probe_offsets.get_offsets(gcmd)
 
         # Limits (Same safe logic as before)
         scan_min_x, scan_max_x = 20.0, 200.0
@@ -1820,11 +1822,13 @@ class BDsensorEndstopWrapper:
             if current_axis == 'X':
                 start_val, end_val = scan_min_x, scan_max_x
                 fixed_pos = center_y
+                probe_pos = fixed_pos + probe_offsets[1]
                 if start_val < phys_min_x + 5: start_val = phys_min_x + 5
                 if end_val > phys_max_x - 5: end_val = phys_max_x - 5
             else:
                 start_val, end_val = scan_min_y, scan_max_y
                 fixed_pos = center_x
+                probe_pos = fixed_pos + probe_offsets[0]
                 if start_val < phys_min_y + 5: start_val = phys_min_y + 5
                 if end_val > phys_max_y - 5: end_val = phys_max_y - 5
 
@@ -1833,15 +1837,38 @@ class BDsensorEndstopWrapper:
 
             for i in range(points):
                 current_pos_val = start_val + (i * step)
-                if current_axis == 'X': target = [current_pos_val, fixed_pos, z_hop]
-                else: target = [fixed_pos, current_pos_val, z_hop]
+                if current_axis == 'X': 
+                    nozzle_target = [current_pos_val, fixed_pos, z_hop]
+                    probe_target = [current_pos_val, probe_pos, z_hop]
+                else: 
+                    nozzle_target = [fixed_pos, current_pos_val, z_hop]
+                    probe_target = [probe_pos, current_pos_val, z_hop]
 
-                self.toolhead.manual_move(target, 100.0)
+                # Move to nozzle probe point
+                self.toolhead.manual_move(nozzle_target, 100.0)
                 self.toolhead.wait_moves()
-                self.gcode.run_script_from_command("G28 Z")
+                # self.gcode.run_script_from_command("G28 Z")
+                session = probe.start_probe_session(gcmd)
+                # Perform probe with nozzle collision
+                self.collision_homing = 1
+                session.run_probe(gcmd)
+
+                # Move to probe without nozzle
+                self.toolhead.manual_move(probe_target, 100.0)
+                self.toolhead.wait_moves()
+
+                # Run non-contact probe
+                self.collision_homing = 0
+                session.run_probe(gcmd)
+                heights = session.pull_probed_results()
+                session.end_probe_session()
+
+                if len(heights) != 2:
+                    raise self.printer.command_error(f"Invalid number of points probed: {len(heights)}")
+
                 time.sleep(0.1)
 
-                val = self.bd_value
+                val = heights[1]-heights[0]
                 axis_data_points.append([current_pos_val, val])
                 self.gcode.respond_info("   Pt %d: Pos=%.1f | Z=%.4f" % (i+1, current_pos_val, val))
                 self.toolhead.manual_move([None, None, z_hop], 100.0)
